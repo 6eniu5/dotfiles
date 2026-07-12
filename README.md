@@ -35,6 +35,7 @@ Requires `stow` (`brew install stow`). The wider machine bootstrap — Homebrew,
 | `git` | `~/.gitconfig` |
 | `htop` | `~/.config/htop` |
 | `nvim` | `~/.config/nvim` (submodule → `6eniu5/kickstart.nvim`) |
+| `swiftbar` | `~/.config/swiftbar/plugins` (CPU/RAM menu-bar plugin, via SwiftBar) |
 
 **Submodules**
 

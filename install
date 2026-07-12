@@ -10,7 +10,7 @@ cd "$DOTFILES_DIR"
 TARGET="${HOME}"
 # Stow packages (symlinked into $HOME). Non-packages (keyboard/, raycast/) are applied
 # by esetup, not stowed, so they are deliberately absent from this list.
-PACKAGES=(fish starship wezterm tmux tmux-sessionizer-config bin atuin git htop nvim)
+PACKAGES=(fish starship wezterm tmux tmux-sessionizer-config bin atuin git htop nvim swiftbar claude)
 
 if ! command -v stow >/dev/null 2>&1; then
   echo "ERROR: GNU stow is required (brew install stow), then re-run ./install." >&2

@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""sysusage — one CPU%/RAM% reading, shared by Starship, Claude Code, and SwiftBar.
+
+Pure stdlib (no psutil, no `top`). Three surfaces call this and each formats the
+same two numbers its own way:
+
+  Starship   `[custom.sysusage]` runs it → segment in the fish prompt.
+  Claude Code statusline-pace.py shells out with --json → segment in its status line.
+  SwiftBar   a *.Ns.sh plugin runs it with --swiftbar → item in the macOS menu bar.
+
+CPU% is a TRUE instantaneous reading: kernel CPU-tick counters (host_processor_info
+via ctypes) are cached in $XDG_CACHE_HOME/sysusage between invocations, and the
+percentage is busy/total over the delta since the last call. Every surface shares
+the cache, so a frequent caller (SwiftBar every 2s) keeps the sample fresh for the
+others. With no recent baseline (first call, or a gap > STALE_AFTER) it falls back
+to a load-average estimate — never wrong-by-staleness, never blocks the prompt.
+
+Env overrides (icons are Nerd Font glyphs; swap if your font lacks them):
+  SYSUSAGE_CPU_ICON  (default microchip)   SYSUSAGE_MEM_ICON  (default database)
+
+Usage:
+  sysusage             `<cpu>% <ram>%` with icons  (default; for Starship)
+  sysusage --labeled   `cpu <cpu>%  ram <ram>%`    (human-readable)
+  sysusage --json      `{"cpu": 12, "ram": 63}`    (for Claude statusline)
+  sysusage --swiftbar  SwiftBar menu-bar + dropdown format
+"""
+
+import ctypes
+import ctypes.util
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+CACHE_DIR = os.path.join(
+    os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "sysusage"
+)
+CPU_CACHE = os.path.join(CACHE_DIR, "cpu.json")
+STALE_AFTER = 30.0  # s; older baseline → fall back rather than average a long gap
+
+CPU_ICON = os.environ.get("SYSUSAGE_CPU_ICON", "")  # nf microchip
+MEM_ICON = os.environ.get("SYSUSAGE_MEM_ICON", "")  # nf database
+
+# Thresholds match statusline-pace.py's severity(): <70 fine, 70+ warn, 90+ hot.
+WARN, HOT = 70, 90
+
+
+# --- CPU: kernel tick delta, cached across invocations ----------------------
+
+
+def _cpu_ticks():
+    """(busy, idle) aggregate CPU ticks since boot via host_processor_info, or None."""
+    try:
+        lib = ctypes.util.find_library("System") or "/usr/lib/libSystem.dylib"
+        libc = ctypes.CDLL(lib, use_errno=True)
+
+        libc.mach_host_self.restype = ctypes.c_uint
+        libc.host_processor_info.restype = ctypes.c_int
+        libc.host_processor_info.argtypes = [
+            ctypes.c_uint,  # host_t
+            ctypes.c_int,  # processor_flavor_t
+            ctypes.POINTER(ctypes.c_uint),  # out processor count
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_int)),  # out info array
+            ctypes.POINTER(ctypes.c_uint),  # out info count
+        ]
+
+        PROCESSOR_CPU_LOAD_INFO = 2
+        USER, SYSTEM, IDLE, NICE = 0, 1, 2, 3  # CPU_STATE_*
+
+        ncpu = ctypes.c_uint(0)
+        info = ctypes.POINTER(ctypes.c_int)()
+        info_cnt = ctypes.c_uint(0)
+        kr = libc.host_processor_info(
+            libc.mach_host_self(),
+            PROCESSOR_CPU_LOAD_INFO,
+            ctypes.byref(ncpu),
+            ctypes.byref(info),
+            ctypes.byref(info_cnt),
+        )
+        if kr != 0:
+            return None
+
+        # Tick counters are unsigned; read them as such so long-uptime values that
+        # set the high bit don't come back negative.
+        ticks = ctypes.cast(info, ctypes.POINTER(ctypes.c_uint))
+        busy = idle = 0
+        for i in range(ncpu.value):
+            b = i * 4
+            busy += ticks[b + USER] + ticks[b + SYSTEM] + ticks[b + NICE]
+            idle += ticks[b + IDLE]
+
+        try:  # best-effort free of the kernel-allocated array
+            libc.mach_task_self.restype = ctypes.c_uint
+            libc.vm_deallocate.argtypes = [
+                ctypes.c_uint,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+            ]
+            libc.vm_deallocate(
+                libc.mach_task_self(),
+                ctypes.cast(info, ctypes.c_void_p),
+                ctypes.sizeof(ctypes.c_int) * info_cnt.value,
+            )
+        except Exception:
+            pass
+
+        return busy, idle
+    except Exception:
+        return None
+
+
+def _loadavg_pct():
+    """Instantaneous fallback: 1-min load average normalised to core count."""
+    try:
+        return max(0.0, min(100.0, os.getloadavg()[0] / (os.cpu_count() or 1) * 100.0))
+    except Exception:
+        return None
+
+
+def _read_cache():
+    try:
+        with open(CPU_CACHE, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def _write_cache(snap):
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        tmp = CPU_CACHE + f".{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(snap, fh)
+        os.replace(tmp, CPU_CACHE)  # atomic; shared safely across callers
+    except OSError:
+        pass
+
+
+def cpu_percent():
+    now = time.time()
+    cur = _cpu_ticks()
+    if cur is None:
+        return _loadavg_pct()
+
+    busy, idle = cur
+    prev = _read_cache()
+    _write_cache({"t": now, "busy": busy, "idle": idle})
+
+    if prev and 0 < (now - prev.get("t", 0)) <= STALE_AFTER:
+        db = busy - prev.get("busy", 0)
+        di = idle - prev.get("idle", 0)
+        total = db + di
+        if db >= 0 and di >= 0 and total > 0:  # db<0 ⇒ counter wrapped; fall back
+            return max(0.0, min(100.0, 100.0 * db / total))
+    return _loadavg_pct()
+
+
+# --- RAM: vm_stat pages that are actually resident --------------------------
+
+
+def ram_percent():
+    """Used = (active + wired + compressed) pages / physical RAM — ~Activity Monitor."""
+    try:
+        total = int(
+            subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip()
+        )
+        out = subprocess.check_output(["vm_stat"], text=True)
+        m = re.search(r"page size of (\d+)", out)
+        page = int(m.group(1)) if m else 4096
+
+        def pages(label):
+            m = re.search(rf"{re.escape(label)}:\s+(\d+)\.", out)
+            return int(m.group(1)) if m else 0
+
+        used = (
+            pages("Pages active")
+            + pages("Pages wired down")
+            + pages("Pages occupied by compressor")
+        ) * page
+        return max(0.0, min(100.0, used / total * 100.0))
+    except Exception:
+        return None
+
+
+# --- presentation -----------------------------------------------------------
+
+
+def pct(v):
+    return "--" if v is None else f"{int(round(v))}%"
+
+
+def swiftbar_color(v):
+    if v is None:
+        return "gray"
+    return "red" if v >= HOT else "orange" if v >= WARN else "green"
+
+
+def render_swiftbar(cpu, ram):
+    # Menu-bar line, then dropdown detail. The macOS menu bar uses the SYSTEM
+    # font (no Nerd Font glyphs → tofu boxes), so use plain text labels here —
+    # unlike the terminal surfaces, which keep the icons.
+    lines = [
+        f"CPU {pct(cpu)}  RAM {pct(ram)} | font=Menlo size=13",
+        "---",
+        f"CPU {pct(cpu)} | color={swiftbar_color(cpu)}",
+        f"RAM {pct(ram)} | color={swiftbar_color(ram)}",
+        "---",
+        "Activity Monitor | bash=/usr/bin/open param1=-a param2='Activity Monitor' terminal=false",
+        "Refresh | refresh=true",
+    ]
+    return "\n".join(lines)
+
+
+def main():
+    arg = sys.argv[1] if len(sys.argv) > 1 else ""
+    cpu = cpu_percent()
+    ram = ram_percent()
+
+    if arg == "--json":
+        cpu_i = None if cpu is None else int(round(cpu))
+        ram_i = None if ram is None else int(round(ram))
+        print(json.dumps({"cpu": cpu_i, "ram": ram_i}))
+    elif arg == "--swiftbar":
+        print(render_swiftbar(cpu, ram))
+    elif arg == "--labeled":
+        print(f"cpu {pct(cpu)}  ram {pct(ram)}")
+    else:  # default: compact, icon-prefixed — for the Starship prompt
+        print(f"{CPU_ICON} {pct(cpu)} {MEM_ICON} {pct(ram)}")
+
+
+if __name__ == "__main__":
+    main()

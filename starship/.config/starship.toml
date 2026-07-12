@@ -67,3 +67,12 @@ symbol = "[⬢](bold green) "
 style = "bold green"
 symbol = "👩💻 "
 disabled = false
+
+# CPU + RAM, from the shared ~/.local/bin/sysusage script (same reading Claude
+# Code and the SwiftBar menu bar use). Absolute path so it resolves whatever
+# subshell Starship spawns; dim like the language-env segments.
+[custom.sysusage]
+command = "$HOME/.local/bin/sysusage"
+when = "true"
+format = "[$output]($style) "
+style = "fg:#5E5E5E"
