@@ -37,6 +37,7 @@ Requires `stow` (`brew install stow`). The wider machine bootstrap — Homebrew,
 | `nvim` | `~/.config/nvim` (submodule → `6eniu5/kickstart.nvim`) |
 | `swiftbar` | `~/.config/swiftbar/plugins` (CPU/RAM menu-bar plugin, via SwiftBar) |
 | `claude` | `~/.claude/statusline-pace.py` (symlink); `settings.json` is **copied** by `install`, not stowed — see `claude/README.md` |
+| `ssh` | `~/.ssh/config` (personal github.com default; **no** private keys — company keys route per-folder via git `includeIf`) |
 
 **Submodules**
 
