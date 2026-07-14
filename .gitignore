@@ -2,6 +2,9 @@
 *.swp
 *.swo
 *~
+# python bytecode (whereami / statusline-pace.py compile artifacts)
+__pycache__/
+*.pyc
 # install-time conflict backups
 *.bak.*
 # fish runtime-generated (should never land here with --no-folding, but be safe)

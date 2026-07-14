@@ -191,6 +191,53 @@ def render_sys():
     return "  ".join(parts) if parts else None
 
 
+# --- git context (shared with the CLI `whereami` command) -------------------
+
+
+WHEREAMI = os.path.expanduser("~/.local/bin/whereami")
+
+
+def whereami(cwd):
+    """The current dir's git context via the shared `whereami` script, or None.
+
+    Run IN the session's cwd (not the statusline process's), with a timeout so a
+    slow git call in a giant repo drops the git line for one render rather than
+    stalling the prompt. Same shell-out contract as render_sys()/sysusage.
+    """
+    try:
+        out = subprocess.run(
+            [WHEREAMI, "--json"],
+            cwd=cwd or None,
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+        ).stdout
+        return json.loads(out)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def render_git(info):
+    """Line three: `branch* ☉ identity`, or None when we're not in a repo.
+
+    The identity turns red on a mismatch — you're about to commit as an identity
+    the folder's includeIf routing says is wrong (whereami computes this).
+    """
+    branch = info.get("branch")
+    if not branch:
+        return None
+
+    seg = paint(CYAN, branch)
+    if info.get("dirty"):
+        seg += paint(YELLOW, "*")
+
+    identity = info.get("identity")
+    if identity:
+        color = RED if info.get("identity_mismatch") else DIM
+        seg += "  " + paint(color, f"☉ {identity}")
+    return seg
+
+
 # --- logging ----------------------------------------------------------------
 
 
@@ -241,14 +288,21 @@ def main():
     ctx = data.get("context_window") or {}
     rate = data.get("rate_limits") or {}
 
+    cwd = (data.get("workspace") or {}).get("current_dir") or data.get("cwd")
+    git = whereami(cwd)
+
     # Line one: who am I talking to, and how hard is it thinking?
     head = paint(BOLD, model)
     if effort:
         head += paint(DIM, f" · {effort}")
 
-    cwd = (data.get("workspace") or {}).get("current_dir") or data.get("cwd")
-    if cwd:
-        head += paint(DIM, f"  {os.path.basename(cwd)}")
+    # Prefer whereami's richer location (repo/within-path); fall back to the bare
+    # leaf name if the shell-out failed or we're outside any repo.
+    path = (git or {}).get("path")
+    if not path and cwd:
+        path = os.path.basename(cwd)
+    if path:
+        head += paint(DIM, f"  {path}")
 
     # Line two: the two meters, side by side.
     ctx_pct = ctx.get("used_percentage")
@@ -269,6 +323,12 @@ def main():
         meters.append(sys_seg)
     print(head)
     print(sep.join(meters))
+
+    # Line three: git context, only when we're inside a repo.
+    if git:
+        git_line = render_git(git)
+        if git_line:
+            print(git_line)
 
 
 if __name__ == "__main__":

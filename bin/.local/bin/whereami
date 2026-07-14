@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""whereami — "where is this shell / Claude Code session running, right now?"
+
+A pure-stdlib snapshot of the current directory's git context. Two surfaces
+consume it, each formatting the same facts its own way:
+
+  You, on the CLI   `whereami`         → a small labeled block.
+  Claude Code       `whereami --json`  → JSON the statusline renders on line 1/3.
+
+It answers three questions:
+
+  Where am I?   A display path that keeps the surrounding "world" visible:
+                  not a repo      → the leaf directory name
+                  at a repo root  → <parent>/<repo>   e.g. 6eniu5/dotfiles
+                  nested          → <repo>/<within>    e.g. dotfiles/claude/.claude
+  What state?   Current branch (short SHA if detached) and whether the working
+                tree is dirty.
+  As whom?      The EFFECTIVE commit identity (`git config user.name`, which
+                honours includeIf routing) — plus whether it MISMATCHES the
+                identity this folder is supposed to use.
+
+The mismatch check derives "supposed to" from git's own includeIf rules at
+runtime; it never hardcodes any folder or identity (see
+docs/adr/0001-whereami-derives-identity-from-git-config.md). It fails SAFE:
+any uncertainty reports no mismatch rather than a false alarm.
+
+Usage:
+  whereami           labeled human block
+  whereami --json    {"path","branch","dirty","identity","identity_mismatch"}
+"""
+
+import json
+import os
+import subprocess
+import sys
+
+# Every git call is bounded so one hung invocation can't stall the caller. The
+# statusline also wraps the whole process in its own timeout; this is defence in
+# depth, not the primary guard.
+GIT_TIMEOUT = 0.8
+
+
+def git(*args, cwd=None):
+    """Run a git command, returning stripped stdout or None on any failure."""
+    try:
+        out = subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=GIT_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.strip()
+
+
+# --- location ---------------------------------------------------------------
+
+
+def display_path(cwd, toplevel):
+    """Human location string per the repo/root/nested rule (see module docstring)."""
+    if not toplevel:
+        # Outside any repo: just the leaf. Guard the filesystem-root edge case
+        # where basename is empty.
+        return os.path.basename(cwd) or cwd
+
+    top_real = os.path.realpath(toplevel)
+    repo = os.path.basename(top_real)
+
+    if os.path.realpath(cwd) == top_real:
+        # At the root: show one directory above so the world (6eniu5 vs Bench)
+        # stays visible. `parent` is empty only if the repo sits at "/".
+        parent = os.path.basename(os.path.dirname(top_real))
+        return f"{parent}/{repo}" if parent else repo
+
+    within = os.path.relpath(os.path.realpath(cwd), top_real)
+    return f"{repo}/{within}"
+
+
+# --- identity mismatch ------------------------------------------------------
+#
+# `git config -l --show-origin` lists every includeIf rule as a literal key even
+# when its condition did not fire, e.g.
+#
+#   file:~/.config/git/local.inc  includeif.gitdir:~/Documents/Projects/Bench/.path=~/.config/git/benchmark.inc
+#
+# We read the gitdir condition from the key and the routed identity from the
+# target file — so no folder or name is ever hardcoded here.
+
+
+def _parse_includeif_rules():
+    """List of (cond_dir, recursive, case_insensitive, target_file) rules.
+
+    The target file's identity is read lazily (only for a rule that actually
+    matches) to keep the common no-match path down to one git call. Returns [] on
+    any trouble — no routing known, so the default identity is expected.
+    """
+    listing = git("config", "-l", "--show-origin")
+    if not listing:
+        return []
+
+    rules = []
+    for line in listing.splitlines():
+        # "<origin>\t<key>=<value>"; we only want includeif.gitdir[/i]:<cond>.path
+        _, _, kv = line.partition("\t")
+        key, sep, target = kv.partition("=")
+        if not sep or not key.startswith("includeif.gitdir"):
+            continue
+        # key = includeif.gitdir:<cond>.path  (or gitdir/i for case-insensitive)
+        insensitive = key.startswith("includeif.gitdir/i:")
+        prefix = "includeif.gitdir/i:" if insensitive else "includeif.gitdir:"
+        body = key[len(prefix):]
+        if not body.endswith(".path"):
+            continue
+        cond = os.path.expanduser(body[: -len(".path")])
+        recursive = cond.endswith("/")
+        rules.append((cond.rstrip("/"), recursive, insensitive, target))
+    return rules
+
+
+def _gitdir_matches(gitdir, cond_dir, recursive, insensitive):
+    """Does an includeIf gitdir condition cover this repo's git directory?
+
+    Only the common absolute / ~-anchored forms are handled. Anything exotic
+    falls through to "no match", keeping the mismatch check conservative.
+    """
+    g = os.path.realpath(gitdir)
+    c = os.path.realpath(cond_dir)
+    if insensitive:
+        g, c = g.lower(), c.lower()
+    if recursive:
+        return g == c or g.startswith(c + os.sep)
+    # Non-recursive: the git directory sits directly in the named directory.
+    return os.path.dirname(g) == c
+
+
+def identity_mismatch(cwd, gitdir, effective_name):
+    """True only when we're CONFIDENT the effective identity is the wrong one.
+
+    Two failure modes are caught, everything else reports False:
+      * a routing rule covers this folder but the effective name isn't its name
+        (includeIf didn't fire, or a local override shadowed it);
+      * no rule covers this folder yet the effective name comes from a repo-local
+        override rather than the global default (company identity in a personal
+        folder).
+    """
+    if not gitdir or not effective_name:
+        return False
+
+    # Last matching rule wins, mirroring git's "later include overrides earlier".
+    matched = None
+    for cond_dir, recursive, insensitive, target in _parse_includeif_rules():
+        if _gitdir_matches(gitdir, cond_dir, recursive, insensitive):
+            matched = target
+
+    if matched is not None:
+        # Routed folder: the routed file's identity is expected.
+        expected = git("config", "--file", os.path.expanduser(matched), "user.name")
+    else:
+        # Unrouted folder: the global default is expected. --global reads only the
+        # global scope (no repo-local override), and no includeIf fired here, so
+        # this is the true default — catches a repo-local override with a *different*
+        # name while ignoring a harmless one that re-states the default.
+        expected = git("config", "--global", "user.name")
+
+    if not expected:
+        return False  # can't determine expected → never a false alarm
+    return effective_name != expected
+
+
+# --- gather -----------------------------------------------------------------
+
+
+def gather():
+    cwd = os.getcwd()
+    # toplevel + git dir in one process; both resolve in any repo, even one with no
+    # commits yet (branch is queried separately below, since --abbrev-ref HEAD fails
+    # on an unborn branch and would sink the whole call with it).
+    rp = git("rev-parse", "--show-toplevel", "--absolute-git-dir", cwd=cwd)
+    lines = rp.splitlines() if rp else []
+    toplevel = lines[0] if len(lines) > 0 else None
+
+    info = {
+        "path": display_path(cwd, toplevel),
+        "branch": None,
+        "dirty": False,
+        "identity": None,
+        "identity_mismatch": False,
+    }
+    if not toplevel:
+        return info
+
+    gitdir = lines[1] if len(lines) > 1 else None
+    branch = git("rev-parse", "--abbrev-ref", "HEAD", cwd=cwd)
+    if branch is None:  # unborn branch (no commits): the ref name still exists
+        branch = git("symbolic-ref", "--short", "HEAD", cwd=cwd)
+    elif branch == "HEAD":  # detached: show the short SHA instead of the word HEAD
+        branch = git("rev-parse", "--short", "HEAD", cwd=cwd)
+    info["branch"] = branch or None
+
+    info["dirty"] = bool(git("status", "--porcelain", cwd=cwd))
+
+    identity = git("config", "user.name", cwd=cwd)
+    info["identity"] = identity or None
+    info["identity_mismatch"] = identity_mismatch(cwd, gitdir, identity)
+
+    return info
+
+
+# --- presentation -----------------------------------------------------------
+
+
+def render_human(info):
+    lines = [f"path      {info['path']}"]
+    if info["branch"] is None:
+        lines.append("(not a git repository)")
+        return "\n".join(lines)
+
+    state = info["branch"] + (" *" if info["dirty"] else "")
+    lines.append(f"branch    {state}")
+    if info["identity"]:
+        flag = "  ⚠ identity mismatch" if info["identity_mismatch"] else ""
+        lines.append(f"identity  {info['identity']}{flag}")
+    return "\n".join(lines)
+
+
+def main():
+    info = gather()
+    if len(sys.argv) > 1 and sys.argv[1] == "--json":
+        print(json.dumps(info))
+    else:
+        print(render_human(info))
+
+
+if __name__ == "__main__":
+    main()
