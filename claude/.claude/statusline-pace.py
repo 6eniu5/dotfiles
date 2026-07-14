@@ -24,6 +24,7 @@ building the history that makes week-over-week projection possible.
 import sys
 import json
 import os
+import re
 import subprocess
 import time
 
@@ -65,6 +66,13 @@ def paint(code, text):
 DIM, BOLD = "2", "1"
 RED, YELLOW, GREEN, CYAN = "31", "33", "32", "36"
 
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def visible_len(s):
+    """Printed width of a line, ignoring its colour-escape codes."""
+    return len(ANSI_RE.sub("", s))
+
 
 def severity(pct):
     """Colour by how much of a budget is gone."""
@@ -87,6 +95,15 @@ def bar(pct, width=10):
 
 def clock(epoch):
     return time.strftime("%a %H:%M", time.localtime(epoch))
+
+
+def reset_label(epoch, now):
+    """When a usage window resets: bare `HH:MM` if it's today, else `Day HH:MM`."""
+    lt = time.localtime(epoch)
+    nt = time.localtime(now)
+    if (lt.tm_year, lt.tm_yday) == (nt.tm_year, nt.tm_yday):
+        return time.strftime("%H:%M", lt)
+    return time.strftime("%a %H:%M", lt)
 
 
 # --- the one formula --------------------------------------------------------
@@ -145,6 +162,8 @@ def render_window(label, window, window_seconds, now):
         return paint(DIM, f"{label} --")
 
     segment = paint(severity(used), f"{label} {used:.0f}%")
+    if resets_at:
+        segment += paint(DIM, f" · resets {reset_label(resets_at, now)}")
 
     ratio, exhaust_at = pace(used, resets_at, window_seconds, now)
     if ratio is None:
@@ -182,12 +201,12 @@ def render_sys():
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
 
-    cpu, ram = stats.get("cpu"), stats.get("ram")
+    cpu, gpu, ram = stats.get("cpu"), stats.get("gpu"), stats.get("ram")
 
     def seg(label, v):
         return paint(severity(v), f"{label} {v}%") if v is not None else None
 
-    parts = [p for p in (seg("cpu", cpu), seg("ram", ram)) if p]
+    parts = [p for p in (seg("CPU", cpu), seg("GPU", gpu), seg("RAM", ram)) if p]
     return "  ".join(parts) if parts else None
 
 
@@ -230,6 +249,9 @@ def render_git(info):
     seg = paint(CYAN, branch)
     if info.get("dirty"):
         seg += paint(YELLOW, "*")
+    if info.get("worktree"):
+        # Only shown inside a linked `git worktree` checkout, not the main tree.
+        seg += paint(DIM, " ⎇ worktree")
 
     identity = info.get("identity")
     if identity:
@@ -291,7 +313,7 @@ def main():
     cwd = (data.get("workspace") or {}).get("current_dir") or data.get("cwd")
     git = whereami(cwd)
 
-    # Line one: who am I talking to, and how hard is it thinking?
+    # Line two: who am I talking to, and how hard is it thinking?
     head = paint(BOLD, model)
     if effort:
         head += paint(DIM, f" · {effort}")
@@ -304,31 +326,41 @@ def main():
     if path:
         head += paint(DIM, f"  {path}")
 
-    # Line two: the two meters, side by side.
+    # Line one: the meters, side by side.
     ctx_pct = ctx.get("used_percentage")
     if ctx_pct is None:
-        ctx_seg = paint(DIM, f"ctx {bar(None)} --")
+        ctx_seg = paint(DIM, f"context {bar(None)} --")
     else:
-        ctx_seg = paint(severity(ctx_pct), f"ctx {bar(ctx_pct)} {ctx_pct:.0f}%")
+        ctx_seg = paint(severity(ctx_pct), f"context {bar(ctx_pct)} {ctx_pct:.0f}%")
         if data.get("exceeds_200k_tokens"):
             ctx_seg += paint(YELLOW, " ⚠")
 
-    five = render_window("5h", rate.get("five_hour"), FIVE_HOURS, now)
-    week = render_window("wk", rate.get("seven_day"), SEVEN_DAYS, now)
+    five = render_window("5-hour", rate.get("five_hour"), FIVE_HOURS, now)
+    week = render_window("7-day", rate.get("seven_day"), SEVEN_DAYS, now)
 
-    sep = paint(DIM, " · ")
+    # Wider gap between groups so the within-window " · resets …" reads as detail
+    # belonging to its window, not as another top-level meter.
+    sep = paint(DIM, "  ·  ")
     meters = [ctx_seg, five, week]
     sys_seg = render_sys()
     if sys_seg:
         meters.append(sys_seg)
-    print(head)
-    print(sep.join(meters))
+
+    lines = [sep.join(meters), head]
 
     # Line three: git context, only when we're inside a repo.
     if git:
         git_line = render_git(git)
         if git_line:
-            print(git_line)
+            lines.append(git_line)
+
+    # A dim horizontal rule between rows, sized to the widest line. Claude Code's
+    # TUI trims blank/whitespace-only rows, so a visible rule — not empty space —
+    # is what actually renders as separation: a light border between the lines. A
+    # closing rule after the last line gives the git info a divider beneath it too.
+    width = max((visible_len(line) for line in lines), default=0)
+    rule = paint(DIM, "─" * width)
+    print(("\n" + rule + "\n").join(lines) + "\n" + rule)
 
 
 if __name__ == "__main__":

@@ -176,10 +176,13 @@ def identity_mismatch(cwd, gitdir, effective_name):
 
 def gather():
     cwd = os.getcwd()
-    # toplevel + git dir in one process; both resolve in any repo, even one with no
-    # commits yet (branch is queried separately below, since --abbrev-ref HEAD fails
-    # on an unborn branch and would sink the whole call with it).
-    rp = git("rev-parse", "--show-toplevel", "--absolute-git-dir", cwd=cwd)
+    # toplevel + per-worktree git dir + shared common dir in one process; all resolve
+    # in any repo, even one with no commits yet (branch is queried separately below,
+    # since --abbrev-ref HEAD fails on an unborn branch and would sink the whole call
+    # with it). --path-format=absolute makes --git-common-dir absolute so it can be
+    # compared to the git dir.
+    rp = git("rev-parse", "--path-format=absolute", "--show-toplevel",
+             "--absolute-git-dir", "--git-common-dir", cwd=cwd)
     lines = rp.splitlines() if rp else []
     toplevel = lines[0] if len(lines) > 0 else None
 
@@ -187,6 +190,7 @@ def gather():
         "path": display_path(cwd, toplevel),
         "branch": None,
         "dirty": False,
+        "worktree": False,
         "identity": None,
         "identity_mismatch": False,
     }
@@ -194,6 +198,11 @@ def gather():
         return info
 
     gitdir = lines[1] if len(lines) > 1 else None
+    commondir = lines[2] if len(lines) > 2 else None
+    # A linked worktree (`git worktree add`) has a per-worktree git dir distinct from
+    # the repo's shared common dir; the main worktree has them equal.
+    if gitdir and commondir:
+        info["worktree"] = os.path.realpath(gitdir) != os.path.realpath(commondir)
     branch = git("rev-parse", "--abbrev-ref", "HEAD", cwd=cwd)
     if branch is None:  # unborn branch (no commits): the ref name still exists
         branch = git("symbolic-ref", "--short", "HEAD", cwd=cwd)
@@ -220,6 +229,8 @@ def render_human(info):
         return "\n".join(lines)
 
     state = info["branch"] + (" *" if info["dirty"] else "")
+    if info.get("worktree"):
+        state += "  (linked worktree)"
     lines.append(f"branch    {state}")
     if info["identity"]:
         flag = "  ⚠ identity mismatch" if info["identity_mismatch"] else ""

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""sysusage — one CPU%/RAM% reading, shared by Starship, Claude Code, and SwiftBar.
+"""sysusage — one CPU%/GPU%/RAM% reading, shared by Starship, Claude Code, and SwiftBar.
 
 Pure stdlib (no psutil, no `top`). Three surfaces call this and each formats the
-same two numbers its own way:
+same three numbers its own way:
 
   Starship   `[custom.sysusage]` runs it → segment in the fish prompt.
   Claude Code statusline-pace.py shells out with --json → segment in its status line.
@@ -15,13 +15,15 @@ the cache, so a frequent caller (SwiftBar every 2s) keeps the sample fresh for t
 others. With no recent baseline (first call, or a gap > STALE_AFTER) it falls back
 to a load-average estimate — never wrong-by-staleness, never blocks the prompt.
 
+GPU% is IOAccelerator "Device Utilization %" via ioreg (no root, no cache needed).
+
 Env overrides (icons are Nerd Font glyphs; swap if your font lacks them):
-  SYSUSAGE_CPU_ICON  (default microchip)   SYSUSAGE_MEM_ICON  (default database)
+  SYSUSAGE_CPU_ICON (microchip)  SYSUSAGE_GPU_ICON (card)  SYSUSAGE_MEM_ICON (database)
 
 Usage:
-  sysusage             `<cpu>% <ram>%` with icons  (default; for Starship)
-  sysusage --labeled   `cpu <cpu>%  ram <ram>%`    (human-readable)
-  sysusage --json      `{"cpu": 12, "ram": 63}`    (for Claude statusline)
+  sysusage             `<cpu>% <gpu>% <ram>%` with icons  (default; for Starship)
+  sysusage --labeled   `cpu <cpu>%  gpu <gpu>%  ram <ram>%`  (human-readable)
+  sysusage --json      `{"cpu": 12, "gpu": 28, "ram": 63}`   (for Claude statusline)
   sysusage --swiftbar  SwiftBar menu-bar + dropdown format
 """
 
@@ -42,6 +44,7 @@ STALE_AFTER = 30.0  # s; older baseline → fall back rather than average a long
 
 CPU_ICON = os.environ.get("SYSUSAGE_CPU_ICON", "")  # nf microchip
 MEM_ICON = os.environ.get("SYSUSAGE_MEM_ICON", "")  # nf database
+GPU_ICON = os.environ.get("SYSUSAGE_GPU_ICON", "󰢮")  # nf md-expansion_card
 
 # Thresholds match statusline-pace.py's severity(): <70 fine, 70+ warn, 90+ hot.
 WARN, HOT = 70, 90
@@ -184,6 +187,29 @@ def ram_percent():
         return None
 
 
+# --- GPU: IOAccelerator utilization, no root --------------------------------
+
+
+def gpu_percent():
+    """GPU utilization % from ioreg's IOAccelerator PerformanceStatistics, or None.
+
+    "Device Utilization %" is published without root on Apple Silicon (AGX) and
+    most Macs. Multiple accelerators (integrated + discrete) → take the busiest.
+    """
+    try:
+        out = subprocess.check_output(
+            ["ioreg", "-r", "-d", "1", "-w", "0", "-c", "IOAccelerator"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    vals = re.findall(r'"Device Utilization %"=(\d+)', out)
+    if not vals:
+        return None
+    return max(0.0, min(100.0, float(max(int(v) for v in vals))))
+
+
 # --- presentation -----------------------------------------------------------
 
 
@@ -197,14 +223,15 @@ def swiftbar_color(v):
     return "red" if v >= HOT else "orange" if v >= WARN else "green"
 
 
-def render_swiftbar(cpu, ram):
+def render_swiftbar(cpu, gpu, ram):
     # Menu-bar line, then dropdown detail. The macOS menu bar uses the SYSTEM
     # font (no Nerd Font glyphs → tofu boxes), so use plain text labels here —
     # unlike the terminal surfaces, which keep the icons.
     lines = [
-        f"CPU {pct(cpu)}  RAM {pct(ram)} | font=Menlo size=13",
+        f"CPU {pct(cpu)}  GPU {pct(gpu)}  RAM {pct(ram)} | font=Menlo size=13",
         "---",
         f"CPU {pct(cpu)} | color={swiftbar_color(cpu)}",
+        f"GPU {pct(gpu)} | color={swiftbar_color(gpu)}",
         f"RAM {pct(ram)} | color={swiftbar_color(ram)}",
         "---",
         "Activity Monitor | bash=/usr/bin/open param1=-a param2='Activity Monitor' terminal=false",
@@ -216,18 +243,20 @@ def render_swiftbar(cpu, ram):
 def main():
     arg = sys.argv[1] if len(sys.argv) > 1 else ""
     cpu = cpu_percent()
+    gpu = gpu_percent()
     ram = ram_percent()
 
+    def as_int(v):
+        return None if v is None else int(round(v))
+
     if arg == "--json":
-        cpu_i = None if cpu is None else int(round(cpu))
-        ram_i = None if ram is None else int(round(ram))
-        print(json.dumps({"cpu": cpu_i, "ram": ram_i}))
+        print(json.dumps({"cpu": as_int(cpu), "gpu": as_int(gpu), "ram": as_int(ram)}))
     elif arg == "--swiftbar":
-        print(render_swiftbar(cpu, ram))
+        print(render_swiftbar(cpu, gpu, ram))
     elif arg == "--labeled":
-        print(f"cpu {pct(cpu)}  ram {pct(ram)}")
+        print(f"cpu {pct(cpu)}  gpu {pct(gpu)}  ram {pct(ram)}")
     else:  # default: compact, icon-prefixed — for the Starship prompt
-        print(f"{CPU_ICON} {pct(cpu)} {MEM_ICON} {pct(ram)}")
+        print(f"{CPU_ICON} {pct(cpu)} {GPU_ICON} {pct(gpu)} {MEM_ICON} {pct(ram)}")
 
 
 if __name__ == "__main__":
