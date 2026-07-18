@@ -1,9 +1,16 @@
 {
+  "model": "opus[1m]",
+  "statusLine": {
+    "type": "command",
+    "command": "python3 /Users/th3g3ntleman/.claude/statusline-pace.py",
+    "padding": 0
+  },
   "enabledPlugins": {
-    "clangd-lsp@claude-plugins-official": true,
+    "clangd-lsp@claude-plugins-official": false,
     "document-skills@anthropic-agent-skills": true,
-    "project-planning@britt": true,
-    "frontend-design@claude-plugins-official": true
+    "project-planning@britt": false,
+    "frontend-design@claude-plugins-official": false,
+    "superpowers@claude-plugins-official": true
   },
   "extraKnownMarketplaces": {
     "britt": {
@@ -19,10 +26,30 @@
       }
     }
   },
+  "effortLevel": "high",
   "tui": "fullscreen",
-  "statusLine": {
-    "type": "command",
-    "command": "python3 /Users/th3g3ntleman/.claude/statusline-pace.py",
-    "padding": 0
-  }
+  "skipWorkflowUsageWarning": true,
+  "permissions": {
+    "defaultMode": "auto",
+    "deny": [
+      "AskUserQuestion",
+      "CronCreate",
+      "CronDelete",
+      "CronList",
+      "DesignSync",
+      "EnterPlanMode",
+      "ExitPlanMode",
+      "NotebookEdit",
+      "PushNotification",
+      "RemoteTrigger",
+      "ReportFindings",
+      "ScheduleWakeup",
+      "SendMessage"
+    ]
+  },
+  "disableBundledSkills": true,
+  "disableWorkflows": true,
+  "disableRemoteControl": true,
+  "disableClaudeAiConnectors": true,
+  "disableArtifact": true
 }
